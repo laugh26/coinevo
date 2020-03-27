@@ -157,7 +157,7 @@ namespace cryptonote
     return true;
   }
 
-  bool checkpoints::init_default_checkpoints(network_type nettype)
+/*  bool checkpoints::init_default_checkpoints(network_type nettype)
   {
     if (nettype == TESTNET)
     {
@@ -209,13 +209,49 @@ namespace cryptonote
     ADD_CHECKPOINT(1579000, "7d0d7a2346373afd41ed1e744a939fc5d474a7dbaa257be5c6fff4009e789241");
     ADD_CHECKPOINT(1668900, "ac2dcaf3d2f58ffcf8391639f0f1ebafcb8eac43c49479c7c37f611868d07568");
     ADD_CHECKPOINT(1775600, "1c6e01c661dc22cab939e79ec6a5272190624ce8356d2f7b958e4f9a57fdb05e");
-    ADD_CHECKPOINT(1856000, "9b57f17f29c71a3acd8a7904b93c41fa6eb8d2b7c73936ce4f1702d14880ba29");
-    ADD_CHECKPOINT(1958000, "98a5d6e51afdf3146e0eefb10a66e8648d8d4d5c2742be8835e976ba217c9bb2");
-    ADD_CHECKPOINT(2046000, "5e867f0b8baefed9244a681df97fc885d8ab36c3dfcd24c7a3abf3b8ac8b8314");
+    */
+ bool checkpoints::init_default_checkpoints(network_type nettype)
+  {
+    switch (nettype) {
+      case STAGENET:
+        break;
+      case TESTNET:
+        break;
+      case FAKECHAIN:
+        break;
+      case UNDEFINED:
+        break;
+      case MAINNET:
+#if !defined(EVO_ENABLE_INTEGRATION_TEST_HOOKS)
+        ADD_CHECKPOINT(0,      "c106ebad646e2dc0f9ab96741b2c320d3435b43d6f6f9660b1f318f33a764ad2");
+        ADD_CHECKPOINT(5,      "40bccdd5ce631f0cc959bb8bf7d3af00c6bae7d93c1a2a9cdcf0d73fb771b8a0");
+        ADD_CHECKPOINT(10,     "45f7a39a86145d97f41dbbbc53b45dc40e7f71cd82a631c8d7d28a7e29d6a94c");
+        ADD_CHECKPOINT(14,     "3cf3d8e066bee9086e4ae8b8e7e9daa214565fc6819ee458c44fdabc497091bc");
+        ADD_CHECKPOINT(18,     "8b064a076d36532d35eae595798021973068d61b893e5ec6f2b07bccd8c54b32");
+        ADD_CHECKPOINT(22,     "7b12fac40ea6a4250ec5d6b6f926d5b75b559b6e6d5f0f81323d6095ebae077b");
+        ADD_CHECKPOINT(26,     "9033f816ad46136e390e6fbafee962ff616cd66445ed62b86447b20feb5b74ed");
+        ADD_CHECKPOINT(30,     "7a22d01f518280d55db3b6276775794b447c52d47ce7170ca6ed7e7959df91e8");
+        ADD_CHECKPOINT(35,     "694565f2d416092520f3ec035783983b61c42e22c6c747550ee72c4e9c4f3b3c");
+        ADD_CHECKPOINT(38,     "4d2b28fa6db6bf242445460e5a9ecc012d4e6b69a3e4365b8ac7f5ba11ee4559");
+        ADD_CHECKPOINT(40,     "93cc7b04ad53df3caa1e9dd251ec711e7772b8edcf50214746978c3f084258e0");
+        ADD_CHECKPOINT(45,     "95dce1c3a9ee47cb2bf8cc56730fb4d5ebf4ea3aef9edbf7442f961e5c000b55");
+        ADD_CHECKPOINT(50,     "c475bc80a36623a941945353f690025caad5db9df2035a44b7931a21e32c9546");
+        ADD_CHECKPOINT(60,     "05936f664158afc7d35f9ae1a1afc6d9c79de96dc9a9e2f0397c126badcdb37d");
+        ADD_CHECKPOINT(66,     "c1f1da7a507e4397c6d4e9a7c42e379bafbce33f83ac9d95aea142e0f2940694");
+        ADD_CHECKPOINT(69,     "154137a51debfbb46494f5319749e93c88aaa2b14af27feae8336962a1465fd5");
+        ADD_CHECKPOINT(70,     "28908e06129e5ce8da5f33f0a0cb84bd07be28b17b8597f17ac0bf060ae3be4c");
+        ADD_CHECKPOINT(71,     "8559184e3fb4e21377429fec6c0f50dbc0b3ec675986037242c60a55f6cb6a56");
+        ADD_CHECKPOINT(72,     "c3c3b1a29d70c4b2b7b2cae8272bbb63ff33e76b11987aec05286d01707eea2a");
+        ADD_CHECKPOINT(78,     "16af409f1d8ca183b565f8a211cd785e45892c51b3b14bf98825591909ed3de0");
+        ADD_CHECKPOINT(25416,  "6bc8e5598098e3743f1a092e5da300f3ef61bed6523a793d5a79c462813bef57");
+        ADD_CHECKPOINT(25417,  "30b8d1fe55235bb43caa405a64e97a63cfb1843122e1cd756ddbace88e4dfaaa"); //v13
+#endif
+        break;
+    }
     return true;
   }
 
-  bool checkpoints::load_checkpoints_from_json(const std::string &json_hashfile_fullpath)
+ bool checkpoints::load_checkpoints_from_json(const std::string &json_hashfile_fullpath)
   {
     boost::system::error_code errcode;
     if (! (boost::filesystem::exists(json_hashfile_fullpath, errcode)))
@@ -239,11 +275,11 @@ namespace cryptonote
       uint64_t height;
       height = it->height;
       if (height <= prev_max_height) {
-	LOG_PRINT_L1("ignoring checkpoint height " << height);
+  LOG_PRINT_L1("ignoring checkpoint height " << height);
       } else {
-	std::string blockhash = it->hash;
-	LOG_PRINT_L1("Adding checkpoint height " << height << ", hash=" << blockhash);
-	ADD_CHECKPOINT(height, blockhash);
+  std::string blockhash = it->hash;
+  LOG_PRINT_L1("Adding checkpoint height " << height << ", hash=" << blockhash);
+  ADD_CHECKPOINT(height, blockhash);
       }
       ++it;
     }
@@ -253,57 +289,6 @@ namespace cryptonote
 
   bool checkpoints::load_checkpoints_from_dns(network_type nettype)
   {
-    std::vector<std::string> records;
-
-    // All four MoneroPulse domains have DNSSEC on and valid
-    static const std::vector<std::string> dns_urls = { "checkpoints.moneropulse.se"
-						     , "checkpoints.moneropulse.org"
-						     , "checkpoints.moneropulse.net"
-						     , "checkpoints.moneropulse.co"
-    };
-
-    static const std::vector<std::string> testnet_dns_urls = { "testpoints.moneropulse.se"
-							     , "testpoints.moneropulse.org"
-							     , "testpoints.moneropulse.net"
-							     , "testpoints.moneropulse.co"
-    };
-
-    static const std::vector<std::string> stagenet_dns_urls = { "stagenetpoints.moneropulse.se"
-                   , "stagenetpoints.moneropulse.org"
-                   , "stagenetpoints.moneropulse.net"
-                   , "stagenetpoints.moneropulse.co"
-    };
-
-    if (!tools::dns_utils::load_txt_records_from_dns(records, nettype == TESTNET ? testnet_dns_urls : nettype == STAGENET ? stagenet_dns_urls : dns_urls))
-      return true; // why true ?
-
-    for (const auto& record : records)
-    {
-      auto pos = record.find(":");
-      if (pos != std::string::npos)
-      {
-        uint64_t height;
-        crypto::hash hash;
-
-        // parse the first part as uint64_t,
-        // if this fails move on to the next record
-        std::stringstream ss(record.substr(0, pos));
-        if (!(ss >> height))
-        {
-    continue;
-        }
-
-        // parse the second part as crypto::hash,
-        // if this fails move on to the next record
-        std::string hashStr = record.substr(pos + 1);
-        if (!epee::string_tools::hex_to_pod(hashStr, hash))
-        {
-    continue;
-        }
-
-        ADD_CHECKPOINT(height, hashStr);
-      }
-    }
     return true;
   }
 
