@@ -4041,8 +4041,8 @@ leave:
     LOG_ERROR("Blocks that failed verification should not reach here");
   }
 
-  for (BlockAddedHook* hook : m_block_added_hooks)
-    hook->block_added(bl, txs);
+//  for (BlockAddedHook* hook : m_block_added_hooks)
+ //   hook->block_added(bl, txs);
 
   TIME_MEASURE_FINISH(addblock);
 
