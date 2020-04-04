@@ -110,7 +110,7 @@ namespace cryptonote
    class BlockAddedHook
     {
     public:
-      virtual void block_added(const block& block, const std::vector<transaction>& txs) = 0;
+      virtual void block_added(const block& bl, const std::vector<transaction>& txs) = 0;
     };
 
     class BlockchainDetachedHook
