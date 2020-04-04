@@ -47,6 +47,9 @@
 #define CURRENT_BLOCK_MINOR_VERSION                     0
 #define CRYPTONOTE_BLOCK_FUTURE_TIME_LIMIT              60*60*2
 #define CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE             10
+// ALPHA REQUIREMENT
+#define ALPHA_REQUIREMENT                             (120*24*31)
+#define ALPHA_RELOCK_WINDOW                           (120*6)
 
 #define BLOCKCHAIN_TIMESTAMP_CHECK_WINDOW               60
 

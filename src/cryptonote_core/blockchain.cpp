@@ -85,7 +85,7 @@ DISABLE_VS_WARNINGS(4267)
 #define BLOCK_REWARD_OVERESTIMATE (10 * 1000000000000)
 
 //------------------------------------------------------------------
-Blockchain::Blockchain(tx_memory_pool& tx_pool) :
+Blockchain::Blockchain(tx_memory_pool& tx_pool, alphas::alpha_list& alpha_list) :
   m_db(), m_tx_pool(tx_pool), m_hardfork(NULL), m_timestamps_and_difficulties_height(0), m_current_block_cumul_weight_limit(0), m_current_block_cumul_weight_median(0),
   m_enforce_dns_checkpoints(false), m_max_prepare_blocks_threads(4), m_db_sync_on_blocks(true), m_db_sync_threshold(1), m_db_sync_mode(db_async), m_db_default_sync(false), m_fast_sync(true), m_show_time_stats(false), m_sync_counter(0), m_bytes_to_sync(0), m_cancel(false),
   m_long_term_block_weights_window(CRYPTONOTE_LONG_TERM_BLOCK_WEIGHT_WINDOW_SIZE),
@@ -94,6 +94,7 @@ Blockchain::Blockchain(tx_memory_pool& tx_pool) :
   m_long_term_block_weights_cache_rolling_median(CRYPTONOTE_LONG_TERM_BLOCK_WEIGHT_WINDOW_SIZE),
   m_difficulty_for_next_block_top_hash(crypto::null_hash),
   m_difficulty_for_next_block(1),
+  m_alpha_list(alpha_list),
   m_btc_valid(false),
   m_batch_success(true),
   m_prepare_height(0)
@@ -444,8 +445,11 @@ bool Blockchain::init(BlockchainDB* db, const network_type nettype, bool offline
     if (!update_next_cumulative_weight_limit())
       return false;
   }
+  for (InitHook* hook : m_init_hooks)
+    hook->init();
   return true;
 }
+
 //------------------------------------------------------------------
 bool Blockchain::init(BlockchainDB* db, HardFork*& hf, const network_type nettype, bool offline)
 {
@@ -899,6 +903,11 @@ std::vector<time_t> Blockchain::get_last_block_timestamps(unsigned int blocks) c
   return timestamps;
 }
 //------------------------------------------------------------------
+uint64_t Blockchain::get_alpha_requirement(uint64_t height) const
+{
+  return UINT64_C(10000000000000000);
+}
+//------------------------------------------------------------------
 // This function removes blocks from the blockchain until it gets to the
 // position where the blockchain switch started and then re-adds the blocks
 // that had been removed.
@@ -971,6 +980,8 @@ bool Blockchain::switch_to_alternative_blockchain(std::list<block_extended_info>
   }
 
   auto split_height = m_db->height();
+  for (BlockchainDetachedHook* hook : m_blockchain_detached_hooks)
+    hook->blockchain_detached(split_height);
 
   //connecting new alternative chain
   for(auto alt_ch_iter = alt_chain.begin(); alt_ch_iter != alt_chain.end(); alt_ch_iter++)
@@ -1192,6 +1203,10 @@ bool Blockchain::validate_miner_transaction(const block& b, size_t cumulative_bl
     MERROR_VER("block weight " << cumulative_block_weight << " is bigger than allowed for this blockchain");
     return false;
   }
+  for (ValidateMinerTxHook* hook : m_validate_miner_tx_hooks)
+    if (!hook->validate_miner_tx(b.prev_id, b.miner_tx, m_db->height(), get_current_hard_fork_version(), base_reward))
+      return false;
+
   if(base_reward + fee < money_in_use)
   {
     MERROR_VER("coinbase transaction spend too much money (" << print_money(money_in_use) << "). Block reward is " << print_money(base_reward + fee) << "(" << print_money(base_reward) << "+" << print_money(fee) << "), cumulative_block_weight " << cumulative_block_weight);
@@ -1480,7 +1495,8 @@ bool Blockchain::create_block_template(block& b, const crypto::hash *from_block,
   //make blocks coin-base tx looks close to real coinbase tx to get truthful blob weight
   uint8_t hf_version = b.major_version;
   size_t max_outs = hf_version >= 4 ? 1 : 11;
-  bool r = construct_miner_tx(height, median_weight, already_generated_coins, txs_weight, fee, miner_address, b.miner_tx, ex_nonce, max_outs, hf_version);
+  account_public_address alpha_address = m_alpha_list.select_winner(b.prev_id);
+  bool r = construct_miner_tx(height, median_weight, already_generated_coins, txs_weight, fee, miner_address, b.miner_tx, ex_nonce, max_outs, hf_version, alpha_address);
   CHECK_AND_ASSERT_MES(r, false, "Failed to construct miner tx, first chance");
   size_t cumulative_weight = txs_weight + get_transaction_weight(b.miner_tx);
 #if defined(DEBUG_CREATE_BLOCK_TEMPLATE)
@@ -1489,7 +1505,7 @@ bool Blockchain::create_block_template(block& b, const crypto::hash *from_block,
 #endif
   for (size_t try_count = 0; try_count != 10; ++try_count)
   {
-    r = construct_miner_tx(height, median_weight, already_generated_coins, cumulative_weight, fee, miner_address, b.miner_tx, ex_nonce, max_outs, hf_version);
+    r = construct_miner_tx(height, median_weight, already_generated_coins, cumulative_weight, fee, miner_address, b.miner_tx, ex_nonce, max_outs, hf_version, alpha_address);
 
     CHECK_AND_ASSERT_MES(r, false, "Failed to construct miner tx, second chance");
     size_t coinbase_weight = get_transaction_weight(b.miner_tx);
@@ -4025,6 +4041,9 @@ leave:
     LOG_ERROR("Blocks that failed verification should not reach here");
   }
 
+  for (BlockAddedHook* hook : m_block_added_hooks)
+    hook->block_added(bl, txs);
+
   TIME_MEASURE_FINISH(addblock);
 
   // do this after updating the hard fork state since the weight limit may change due to fork
@@ -5158,6 +5177,26 @@ bool Blockchain::for_all_outputs(std::function<bool(uint64_t amount, const crypt
 bool Blockchain::for_all_outputs(uint64_t amount, std::function<bool(uint64_t height)> f) const
 {
   return m_db->for_all_outputs(amount, f);;
+}
+
+void Blockchain::hook_init(Blockchain::InitHook& init_hook)
+{
+  m_init_hooks.push_back(&init_hook);
+}
+
+void Blockchain::hook_block_added(Blockchain::BlockAddedHook& block_added_hook)
+{
+  m_block_added_hooks.push_back(&block_added_hook);
+}
+
+void Blockchain::hook_blockchain_detached(Blockchain::BlockchainDetachedHook& blockchain_detached_hook)
+{
+  m_blockchain_detached_hooks.push_back(&blockchain_detached_hook);
+}
+
+void Blockchain::hook_validate_miner_tx(Blockchain::ValidateMinerTxHook& validate_miner_tx_hook)
+{
+  m_validate_miner_tx_hooks.push_back(&validate_miner_tx_hook);
 }
 
 void Blockchain::invalidate_block_template_cache()

@@ -1266,20 +1266,12 @@ int main(int argc, char* argv[])
     return 1;
   }
 
-   std::vector<Blockchain*> core_storage(inputs.size());
-   for (size_t n = 0; n < inputs.size(); ++n)
-  struct BlockchainObjects
-    {
-      Blockchain m_blockchain;
-      tx_memory_pool m_mempool;
-      alphas::alpha_list m_alpha_list;
-      BlockchainObjects() :
-        m_blockchain(m_mempool, m_alpha_list),
-        m_alpha_list(m_blockchain),
-        m_mempool(m_blockchain) { }
-    };
-    BlockchainObjects* blockchain_objects = new BlockchainObjects();
+  std::vector<Blockchain*> core_storage(inputs.size());
+  for (size_t n = 0; n < inputs.size(); ++n)
+  {
+    blockchain_objects_t *blockchain_objects = new blockchain_objects_t();
     core_storage[n] = &(blockchain_objects->m_blockchain);
+  }
 
   const std::string cache_dir = (output_file_path / "spent-outputs-cache").string();
   init(cache_dir);

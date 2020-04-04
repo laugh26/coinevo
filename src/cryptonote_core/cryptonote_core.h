@@ -41,6 +41,7 @@
 #include "common/command_line.h"
 #include "tx_pool.h"
 #include "blockchain.h"
+#include "alpha_list.h"
 #include "cryptonote_basic/miner.h"
 #include "cryptonote_basic/connection_context.h"
 #include "cryptonote_basic/cryptonote_stat_info.h"
@@ -1026,6 +1027,7 @@ namespace cryptonote
 
      tx_memory_pool m_mempool; //!< transaction pool instance
      Blockchain m_blockchain_storage; //!< Blockchain instance
+      alphas::alpha_list m_alpha_list;
 
      i_cryptonote_protocol* m_pprotocol; //!< cryptonote protocol instance
 
