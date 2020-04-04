@@ -44,21 +44,26 @@ using namespace epee;
 #include "crypto/hash.h"
 #include "ringct/rctSigs.h"
 #include "multisig/multisig.h"
+#include "int-util.h"
 
 using namespace crypto;
 
 namespace cryptonote
 {
   //---------------------------------------------------------------
-  void classify_addresses(const std::vector<tx_destination_entry> &destinations, const boost::optional<cryptonote::account_public_address>& change_addr, size_t &num_stdaddresses, size_t &num_subaddresses, account_public_address &single_dest_subaddress)
+  static void classify_addresses(const std::vector<tx_destination_entry> &destinations, const boost::optional<cryptonote::tx_destination_entry>& change_addr, size_t &num_stdaddresses, size_t &num_subaddresses, account_public_address &single_dest_subaddress)
   {
     num_stdaddresses = 0;
     num_subaddresses = 0;
     std::unordered_set<cryptonote::account_public_address> unique_dst_addresses;
+    bool change_found = false;
     for(const tx_destination_entry& dst_entr: destinations)
     {
-      if (change_addr && dst_entr.addr == change_addr)
+      if (change_addr && *change_addr == dst_entr && !change_found)
+      {
+        change_found = true;
         continue;
+      }
       if (unique_dst_addresses.count(dst_entr.addr) == 0)
       {
         unique_dst_addresses.insert(dst_entr.addr);
@@ -76,15 +81,165 @@ namespace cryptonote
     LOG_PRINT_L2("destinations include " << num_stdaddresses << " standard addresses and " << num_subaddresses << " subaddresses");
   }
 
- uint64_t get_alpha_reward(uint64_t height, uint64_t base_reward, uint8_t hard_fork_version)
+  keypair get_deterministic_keypair_from_height(uint64_t height)
   {
-    return hard_fork_version >= 14 ? base_reward / 2 : 0;
+    keypair k;
+
+    ec_scalar& sec = k.sec;
+
+    for (int i=0; i < 8; i++)
+    {
+      uint64_t height_byte = height & ((uint64_t)0xFF << (i*8));
+      uint8_t byte = height_byte >> i*8;
+      sec.data[i] = byte;
+    }
+    for (int i=8; i < 32; i++)
+    {
+      sec.data[i] = 0x00;
+    }
+
+    generate_keys(k.pub, k.sec, k.sec, true);
+
+    return k;
   }
-  //---------------------------------------------------------------
-  bool construct_miner_tx(size_t height, size_t median_weight, uint64_t already_generated_coins, size_t current_block_weight, uint64_t fee, const account_public_address &miner_address, transaction& tx, const blobdata& extra_nonce, size_t max_outs, uint8_t hard_fork_version, const account_public_address alpha_address) {
+
+  bool get_deterministic_output_key(const account_public_address& address, const keypair& tx_key, size_t output_index, crypto::public_key& output_key)
+  {
+
+    crypto::key_derivation derivation{};
+    bool r = crypto::generate_key_derivation(address.m_view_public_key, tx_key.sec, derivation);
+    CHECK_AND_ASSERT_MES(r, false, "failed to generate_key_derivation(" << address.m_view_public_key << ", " << tx_key.sec << ")");
+
+    r = crypto::derive_public_key(derivation, output_index, address.m_spend_public_key, output_key);
+    CHECK_AND_ASSERT_MES(r, false, "failed to derive_public_key(" << derivation << ", " << output_index << ", "<< address.m_spend_public_key << ")");
+
+    return true;
+  }
+
+  bool validate_evod_reward_key(uint64_t height, const std::string& evod_wallet_address_str, size_t output_index, const crypto::public_key& output_key, const cryptonote::network_type nettype)
+  {
+    keypair gov_key = get_deterministic_keypair_from_height(height);
+
+    cryptonote::address_parse_info evod_wallet_address;
+    cryptonote::get_account_address_from_str(evod_wallet_address, nettype, evod_wallet_address_str);
+    crypto::public_key correct_key;
+
+    if (!get_deterministic_output_key(evod_wallet_address.address, gov_key, output_index, correct_key))
+    {
+      MERROR("Failed to generate deterministic output key for evod wallet output validation");
+      return false;
+    }
+
+    return correct_key == output_key;
+  }
+
+  uint64_t evod_reward_formula(uint64_t base_reward, uint8_t hf_version)
+  {
+    return hf_version >= 14     ? FOUNDATION_REWARD_HF14 : base_reward / 20;
+  }
+
+  bool block_has_evod_output(network_type nettype, cryptonote::block const &block)
+  {
+    bool result = height_has_evod_output(nettype, block.major_version, get_block_height(block));
+    return result;
+  }
+
+  bool height_has_evod_output(network_type nettype, uint8_t hard_fork_version, uint64_t height)
+  {
+    if (height == 0)
+      return false;
+
+    if (hard_fork_version <= 14)
+      return true;
+
+    const cryptonote::config_t &network = cryptonote::get_config(nettype, hard_fork_version);
+    if (height % network.EVOD_REWARD_INTERVAL != 0)
+    {
+      return false;
+    }
+
+    return true;
+  }
+
+  uint64_t derive_evod_from_block_reward(network_type nettype, const cryptonote::block &block, uint8_t hf_version)
+  {
+    if (hf_version >= 14)
+      return evod_reward_formula(0, hf_version);
+
+    uint64_t result       = 0;
+    uint64_t snode_reward = 0;
+    size_t vout_end     = block.miner_tx.vout.size();
+
+    if (block_has_evod_output(nettype, block))
+      --vout_end; 
+
+    for (size_t vout_index = 1; vout_index < vout_end; ++vout_index)
+    {
+      tx_out const &output = block.miner_tx.vout[vout_index];
+      alphanode_reward += output.amount;
+    }
+
+    uint64_t base_reward  = alphanode_reward * 2; 
+    uint64_t evod   = evod_reward_formula(base_reward, hf_version);
+    uint64_t block_reward = base_reward - evod;
+
+    uint64_t actual_reward = 0; // sanity check
+    for (tx_out const &output : block.miner_tx.vout) actual_reward += output.amount;
+
+    CHECK_AND_ASSERT_MES(block_reward <= actual_reward, false,
+        "Rederiving the base block reward from the service node reward "
+        "exceeded the actual amount paid in the block, derived block reward: "
+        << block_reward << ", actual reward: " << actual_reward);
+
+    result = evod;
+    return result;
+  }
+
+  uint64_t alpha_reward_formula(uint64_t base_reward, uint8_t hard_fork_version)
+  {
+    return
+      hard_fork_version >= 14 ? ALPHA_REWARD_BASE : 0;
+  }
+
+  uint64_t get_portion_of_reward(uint64_t portions, uint64_t total_alpha_reward)
+  {
+    uint64_t hi, lo, rewardhi, rewardlo;
+    lo = mul128(total_alpha_reward, portions, &hi);
+    div128_64(hi, lo, ALPHA_PORTIONS, &rewardhi, &rewardlo);
+    return rewardlo;
+  }
+
+  static uint64_t calculate_sum_of_portions(const std::vector<alphas::payout_entry>& payouts, uint64_t total_alpha_reward)
+  {
+    uint64_t reward = 0;
+    for (size_t i = 0; i < payouts.size(); i++)
+      reward += get_portion_of_reward(payouts[i].portions, total_alpha_reward);
+    return reward;
+  }
+
+  bool construct_miner_tx(
+      size_t height,
+      size_t median_weight,
+      uint64_t already_generated_coins,
+      size_t current_block_weight,
+      uint64_t fee,
+      const account_public_address &miner_address,
+      transaction& tx,
+      const blobdata& extra_nonce,
+      uint8_t hard_fork_version,
+      const coinevo_miner_tx_context &miner_tx_context)
+  {
+    const network_type nettype = miner_tx_context.nettype;
+
     tx.vin.clear();
     tx.vout.clear();
     tx.extra.clear();
+    tx.output_unlock_times.clear();
+    tx.type    = txtype::standard;
+    tx.version = transaction::get_max_version_for_hf(hard_fork_version);
+
+    const crypto::public_key &alpha_key                        = miner_tx_context.block_winner.key;
+    const std::vector<alphas::payout_entry> &alpha_info = miner_tx_context.block_winner.payouts;
 
     keypair txkey = keypair::generate(hw::get_device("default"));
     add_tx_pub_key_to_extra(tx, txkey.pub);
@@ -94,32 +249,35 @@ namespace cryptonote
     if (!sort_tx_extra(tx.extra, tx.extra))
       return false;
 
+    keypair evo_key = get_deterministic_keypair_from_height(height); 
+    if (already_generated_coins != 0)
+    {
+      add_tx_pub_key_to_extra(tx, evo_key.pub);
+    }
+
+    add_alpha_winner_to_tx_extra(tx.extra, alpha_key);
+
     txin_gen in;
     in.height = height;
 
-    uint64_t block_reward;
-    if(!get_block_reward(median_weight, current_block_weight, already_generated_coins, block_reward, hard_fork_version))
+    coinevo_block_reward_context block_reward_context = {};
+    block_reward_context.fee                       = fee;
+    block_reward_context.height                    = height;
+    block_reward_context.alpha_payouts      = miner_tx_context.block_winner.payouts;
+    block_reward_context.batched_evod        = miner_tx_context.batched_evod;
+
+    block_reward_parts reward_parts;
+    if(!get_coinevo_block_reward(median_weight, current_block_weight, already_generated_coins, hard_fork_version, reward_parts, block_reward_context))
     {
-      LOG_PRINT_L0("Block is too big");
+      LOG_PRINT_L0("Failed to calculate block reward");
       return false;
     }
 
-#if defined(DEBUG_CREATE_BLOCK_TEMPLATE)
-    LOG_PRINT_L1("Creating block template: reward " << block_reward <<
-      ", fee " << fee);
-#endif
-    uint64_t alpha_reward = 0;
-     if (already_generated_coins != 0) 
-     {
-      alpha_reward = get_alpha_reward(height, block_reward, hard_fork_version);
-      block_reward -= alpha_reward;
-      }
-    block_reward += fee;
-
     uint64_t summary_amounts = 0;
+    // Miner Reward
     {
-      crypto::key_derivation derivation = AUTO_VAL_INIT(derivation);
-      crypto::public_key out_eph_public_key = AUTO_VAL_INIT(out_eph_public_key);
+      crypto::key_derivation derivation{};
+      crypto::public_key out_eph_public_key{};
       bool r = crypto::generate_key_derivation(miner_address.m_view_public_key, txkey.sec, derivation);
       CHECK_AND_ASSERT_MES(r, false, "while creating outs: failed to generate_key_derivation(" << miner_address.m_view_public_key << ", " << txkey.sec << ")");
 
@@ -130,60 +288,134 @@ namespace cryptonote
       tk.key = out_eph_public_key;
 
       tx_out out;
-   summary_amounts += out.amount = block_reward;
+      summary_amounts += out.amount = reward_parts.miner_reward();
       out.target = tk;
       tx.vout.push_back(out);
+      tx.output_unlock_times.push_back(height + CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW);
     }
 
     if (hard_fork_version >= 14)
     {
-     for (size_t i = 0; i < alpha_info.size(); i++)
-    {
-     alphas::payout_entry const &payout = alpha_info[i];	
-	        crypto::key_derivation derivation{};	
-	        crypto::public_key out_eph_public_key{};	
-	        bool r = crypto::generate_key_derivation(payout.address.m_view_public_key,  derivation);	
-	        CHECK_AND_ASSERT_MES(r, false, "while creating outs: failed to generate_key_derivation(" << payout.address.m_view_public_key << ")");	
-	        r = crypto::derive_public_key(derivation, 1+i, payout.address.m_spend_public_key, out_eph_public_key);	
-	        CHECK_AND_ASSERT_MES(r, false, "while creating outs: failed to derive_public_key(" << derivation << ", " << (1+i) << ", "<< payout.address.m_spend_public_key << ")");
+      for (size_t i = 0; i < alpha_info.size(); i++)
+      {
+        alphas::payout_entry const &payout = alpha_info[i];
+        crypto::key_derivation derivation{};
+        crypto::public_key out_eph_public_key{};
+        bool r = crypto::generate_key_derivation(payout.address.m_view_public_key, evo_key.sec, derivation);
+        CHECK_AND_ASSERT_MES(r, false, "while creating outs: failed to generate_key_derivation(" << payout.address.m_view_public_key << ", " << evo_key.sec << ")");
+        r = crypto::derive_public_key(derivation, 1+i, payout.address.m_spend_public_key, out_eph_public_key);
+        CHECK_AND_ASSERT_MES(r, false, "while creating outs: failed to derive_public_key(" << derivation << ", " << (1+i) << ", "<< payout.address.m_spend_public_key << ")");
 
-      txout_to_key tk;
-      tk.key = out_eph_public_key;
+        txout_to_key tk;
+        tk.key = out_eph_public_key;
 
-      tx_out out;
-       summary_amounts += out.amount = alpha_reward; 
-      out.target = tk;
-      tx.vout.push_back(out);
+        tx_out out;
+        summary_amounts += out.amount = get_portion_of_reward(payout.portions, reward_parts.alpha_total);
+        out.target = tk;
+        tx.vout.push_back(out);
+        tx.output_unlock_times.push_back(height + CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW);
+      }
     }
 
-    CHECK_AND_ASSERT_MES(summary_amounts == block_reward + alpha_reward, false, "Failed to construct miner tx, summary_amounts = " << summary_amounts << " not equal block_reward = " << block_reward + alpha_reward);
+    // Evod Distribution
+    if (already_generated_coins != 0)
+    {
+      if (reward_parts.evod_paid == 0)
+      {
+        CHECK_AND_ASSERT_MES(hard_fork_version >= 14, false, "Evod reward can NOT be 0 before hardfork 14, hard_fork_version: " << hard_fork_version);
+      }
+      else
+      {
+        cryptonote::address_parse_info evod_wallet_address;
+        cryptonote::get_account_address_from_str(evod_wallet_address, nettype, *cryptonote::get_config(nettype, hard_fork_version).EVOD_WALLET_ADDRESS);
+        crypto::public_key out_eph_public_key{};
 
-    if (hard_fork_version >= 4)
-      tx.version = 2;
-    else
-      tx.version = 1;
+        if (!get_deterministic_output_key(evod_wallet_address.address, evo_key, tx.vout.size(), out_eph_public_key))
+        {
+          MERROR("Failed to generate deterministic output key for evod wallet output creation");
+          return false;
+        }
+
+        txout_to_key tk;
+        tk.key = out_eph_public_key;
+
+        tx_out out;
+        summary_amounts += out.amount = reward_parts.evod_paid;
+        out.target = tk;
+        tx.vout.push_back(out);
+        tx.output_unlock_times.push_back(height + CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW);
+      }
+    }
+
+    uint64_t expected_amount = reward_parts.miner_reward() + reward_parts.evod_paid + reward_parts.alpha_paid;
+    CHECK_AND_ASSERT_MES(summary_amounts == expected_amount, false, "Failed to construct miner tx, summary_amounts = " << summary_amounts << " not equal total block_reward = " << expected_amount);
 
     //lock
     tx.unlock_time = height + CRYPTONOTE_MINED_MONEY_UNLOCK_WINDOW;
     tx.vin.push_back(in);
-
     tx.invalidate_hashes();
 
     //LOG_PRINT("MINER_TX generated ok, block_reward=" << print_money(block_reward) << "("  << print_money(block_reward - fee) << "+" << print_money(fee)
     //  << "), current_block_size=" << current_block_size << ", already_generated_coins=" << already_generated_coins << ", tx_id=" << get_transaction_hash(tx), LOG_LEVEL_2);
     return true;
   }
-  //---------------------------------------------------------------
-  crypto::public_key get_destination_view_key_pub(const std::vector<tx_destination_entry> &destinations, const boost::optional<cryptonote::account_public_address>& change_addr)
+
+  bool get_coinevo_block_reward(size_t median_weight, size_t current_block_weight, uint64_t already_generated_coins, int hard_fork_version, block_reward_parts &result, const coinevo_block_reward_context &coinevo_context)
+  {
+    result = {};
+    uint64_t base_reward, base_reward_unpenalized;
+    if (!get_base_block_reward(median_weight, current_block_weight, already_generated_coins, base_reward, base_reward_unpenalized, hard_fork_version, coinevo_context.height))
+    {
+      MERROR("Failed to calculate base block reward");
+      return false;
+    }
+
+    if (base_reward == 0)
+    {
+      MERROR("Unexpected base reward of 0");
+      return false;
+    }
+
+    if (already_generated_coins == 0)
+    {
+      result.original_base_reward = result.base_miner = base_reward;
+      return true;
+    }
+
+
+    result.original_base_reward =
+        hard_fork_version >= 14 ? base_reward_unpenalized : base_reward;
+
+    result.alpha_total = alpha_reward_formula(result.original_base_reward, hard_fork_version);
+    result.alpha_paid  = calculate_sum_of_portions(coinevo_context.alpha_payouts, result.alpha_total);
+
+
+    result.evod_due  = evod_reward_formula(result.original_base_reward, hard_fork_version);
+    result.evod_paid = hard_fork_version >= 14
+        ? coinevo_context.batched_evod
+        : result.evod_due;
+
+    uint64_t non_miner_amounts = result.evod_due + result.evod_paid;
+    result.base_miner = base_reward > non_miner_amounts ? base_reward - non_miner_amounts : 0;
+    result.base_miner_fee = coinevo_context.fee;
+
+    return true;
+  }
+
+  crypto::public_key get_destination_view_key_pub(const std::vector<tx_destination_entry> &destinations, const boost::optional<cryptonote::tx_destination_entry>& change_addr)
   {
     account_public_address addr = {null_pkey, null_pkey};
     size_t count = 0;
+    bool found_change = false;
     for (const auto &i : destinations)
     {
       if (i.amount == 0)
         continue;
-      if (change_addr && i.addr == *change_addr)
+      if (change_addr && *change_addr == i && !found_change)
+      {
+        found_change = true;
         continue;
+      }
       if (i.addr == addr)
         continue;
       if (count > 0)
@@ -192,11 +424,11 @@ namespace cryptonote
       ++count;
     }
     if (count == 0 && change_addr)
-      return change_addr->m_view_public_key;
+      return change_addr->addr.m_view_public_key;
     return addr.m_view_public_key;
   }
   //---------------------------------------------------------------
-  bool construct_tx_with_tx_key(const account_keys& sender_account_keys, const std::unordered_map<crypto::public_key, subaddress_index>& subaddresses, std::vector<tx_source_entry>& sources, std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::account_public_address>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, uint64_t unlock_time, const crypto::secret_key &tx_key, const std::vector<crypto::secret_key> &additional_tx_keys, bool rct, const rct::RCTConfig &rct_config, rct::multisig_out *msout, bool shuffle_outs)
+  bool construct_tx_with_tx_key(const account_keys& sender_account_keys, const std::unordered_map<crypto::public_key, subaddress_index>& subaddresses, std::vector<tx_source_entry>& sources, std::vector<tx_destination_entry>& destinations, const boost::optional<tx_destination_entry>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, uint64_t unlock_time, const crypto::secret_key &tx_key, const std::vector<crypto::secret_key> &additional_tx_keys, const rct::RCTConfig &rct_config, rct::multisig_out *msout, bool shuffle_outs, coinevo_construct_tx_params const &tx_params)
   {
     hw::device &hwdev = sender_account_keys.get_device();
 
@@ -214,17 +446,35 @@ namespace cryptonote
       msout->c.clear();
     }
 
-    tx.version = rct ? 2 : 1;
-    tx.unlock_time = unlock_time;
+    tx.version = transaction::get_max_version_for_hf(tx_params.hf_version);
+    tx.type    = tx_params.tx_type;
+    if (tx.version <= txversion::v2_ringct)
+      tx.unlock_time = unlock_time;
+
+    if (tx_params.burn_percent)
+    {
+      LOG_ERROR("cannot construct tx: internal error: burn percent must be converted to fixed burn amount in the wallet");
+      return false;
+    }
+
+    if (tx_params.burn_fixed && tx_params.hf_version < 14)
+    {
+      LOG_ERROR("cannot construct tx: burn can not be specified before hard fork 14");
+      return false;
+    }
 
     tx.extra = extra;
     crypto::public_key txkey_pub;
+
+    if (tx.type == txtype::alpha)
+      add_tx_secret_key_to_tx_extra(tx.extra, tx_key);
 
     // if we have a stealth payment id, find it and encrypt it with the tx key now
     std::vector<tx_extra_field> tx_extra_fields;
     if (parse_tx_extra(tx.extra, tx_extra_fields))
     {
       bool add_dummy_payment_id = true;
+
       tx_extra_nonce extra_nonce;
       if (find_tx_extra_field_by_type(tx_extra_fields, extra_nonce))
       {
@@ -352,7 +602,7 @@ namespace cryptonote
 
     if (shuffle_outs)
     {
-      std::shuffle(destinations.begin(), destinations.end(), crypto::random_device{});
+      std::shuffle(destinations.begin(), destinations.end(), std::default_random_engine(crypto::rand<unsigned int>()));
     }
 
     // sort ins by their key image
@@ -400,15 +650,55 @@ namespace cryptonote
     uint64_t summary_outs_money = 0;
     //fill outputs
     size_t output_index = 0;
+
+    tx_extra_tx_key_image_proofs key_image_proofs;
+    bool found_change_already = false;
     for(const tx_destination_entry& dst_entr: destinations)
     {
-      CHECK_AND_ASSERT_MES(dst_entr.amount > 0 || tx.version > 1, false, "Destination with wrong amount: " << dst_entr.amount);
+      CHECK_AND_ASSERT_MES(dst_entr.amount > 0 || tx.version >= txversion::v2_ringct, false, "Destination with wrong amount: " << dst_entr.amount);
       crypto::public_key out_eph_public_key;
 
-      hwdev.generate_output_ephemeral_keys(tx.version,sender_account_keys, txkey_pub, tx_key,
+      bool this_dst_is_change_addr = false;
+      hwdev.generate_output_ephemeral_keys(static_cast<uint16_t>(tx.version), this_dst_is_change_addr, sender_account_keys, txkey_pub, tx_key,
                                            dst_entr, change_addr, output_index,
                                            need_additional_txkeys, additional_tx_keys,
                                            additional_tx_public_keys, amount_keys, out_eph_public_key);
+
+      if (tx.version >= txversion::v3_per_output_unlock_times)
+      {
+        if (change_addr && *change_addr == dst_entr && this_dst_is_change_addr && !found_change_already)
+        {
+          found_change_already = true;
+          tx.output_unlock_times.push_back(0); // 0 unlock time for change
+        }
+        else
+        {
+          tx.output_unlock_times.push_back(unlock_time); // for now, all non-change have same unlock time
+        }
+      }
+
+      if (tx.type == txtype::alpha)
+      {
+        CHECK_AND_ASSERT_MES(dst_entr.addr == sender_account_keys.m_account_address, false, "A alpha contribution must return back to the original sendee otherwise the pre-calculated key image is incorrect");
+        CHECK_AND_ASSERT_MES(dst_entr.is_subaddress == false, false, "alpha back to a subaddress is not allowed"); // TODO(coinevo): Maybe one day, revisit this
+        CHECK_AND_ASSERT_MES(need_additional_txkeys == false, false, "alpha TX's can not required additional TX Keys"); // TODO(coinevo): Maybe one day, revisit this
+
+        if (!(change_addr && *change_addr == dst_entr))
+        {
+          tx_extra_tx_key_image_proofs::proof proof = {};
+          keypair                ephemeral_keys = {};
+          const subaddress_index zeroth_address = {};
+          if(!generate_key_image_helper(sender_account_keys, subaddresses, out_eph_public_key, txkey_pub, additional_tx_public_keys, output_index, ephemeral_keys, proof.key_image, hwdev))
+          {
+            LOG_ERROR("Key image generation failed for alpha TX!");
+            return false;
+          }
+
+          crypto::public_key const *out_eph_public_key_ptr = &out_eph_public_key;
+          crypto::generate_ring_signature((const crypto::hash&)proof.key_image, proof.key_image, &out_eph_public_key_ptr, 1, ephemeral_keys.sec, 0, &proof.signature);
+          key_image_proofs.proofs.push_back(proof);
+        }
+      }
 
       tx_out out;
       out.amount = dst_entr.amount;
@@ -420,6 +710,15 @@ namespace cryptonote
       summary_outs_money += dst_entr.amount;
     }
     CHECK_AND_ASSERT_MES(additional_tx_public_keys.size() == additional_tx_keys.size(), false, "Internal error creating additional public keys");
+
+    if (tx.type == txtype::alpha)
+    {
+      CHECK_AND_ASSERT_MES(key_image_proofs.proofs.size() >= 1, false, "No key image proofs were generated for alpha tx");
+      add_tx_key_image_proofs_to_tx_extra(tx.extra, key_image_proofs);
+
+      if (tx_params.hf_version <= cryptonote::network_version_13_enforce_checkpoints)
+        tx.type = txtype::standard;
+    }
 
     remove_field_from_tx_extra(tx.extra, typeid(tx_extra_additional_pub_keys));
 
@@ -451,7 +750,7 @@ namespace cryptonote
       MDEBUG("Null secret key, skipping signatures");
     }
 
-    if (tx.version == 1)
+    if (tx.version == txversion::v1)
     {
       //generate ring signatures
       crypto::hash tx_prefix_hash;
@@ -577,6 +876,21 @@ namespace cryptonote
       if (!use_simple_rct && amount_in > amount_out)
         outamounts.push_back(amount_in - amount_out);
 
+      if (tx_params.burn_fixed)
+      {
+        if (amount_in < amount_out + tx_params.burn_fixed)
+        {
+          LOG_ERROR("invalid burn amount: tx does not have enough unspent funds available; amount_in: " << std::to_string(amount_in) << "; amount_out + tx_params.burn_fixed: " << std::to_string(amount_out) << " + " << std::to_string(tx_params.burn_fixed));
+          return false;
+        }
+        remove_field_from_tx_extra(tx.extra, typeid(tx_extra_burn)); // doesn't have to be present (but the wallet puts a dummy here as a safety to avoid growing the tx)
+        if (!add_burned_amount_to_tx_extra(tx.extra, tx_params.burn_fixed))
+        {
+          LOG_ERROR("failed to add burn amount to tx extra");
+          return false;
+        }
+      }
+
       // zero out all amounts to mask rct outputs, real amounts are now encrypted
       for (size_t i = 0; i < tx.vin.size(); ++i)
       {
@@ -605,46 +919,38 @@ namespace cryptonote
     return true;
   }
   //---------------------------------------------------------------
-  bool construct_tx_and_get_tx_key(const account_keys& sender_account_keys, const std::unordered_map<crypto::public_key, subaddress_index>& subaddresses, std::vector<tx_source_entry>& sources, std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::account_public_address>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, uint64_t unlock_time, crypto::secret_key &tx_key, std::vector<crypto::secret_key> &additional_tx_keys, bool rct, const rct::RCTConfig &rct_config, rct::multisig_out *msout, bool is_alpha_tx)
+  bool construct_tx_and_get_tx_key(const account_keys& sender_account_keys, const std::unordered_map<crypto::public_key, subaddress_index>& subaddresses, std::vector<tx_source_entry>& sources, std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::tx_destination_entry>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, uint64_t unlock_time, crypto::secret_key &tx_key, std::vector<crypto::secret_key> &additional_tx_keys, const rct::RCTConfig &rct_config, rct::multisig_out *msout, coinevo_construct_tx_params const &tx_params)
   {
     hw::device &hwdev = sender_account_keys.get_device();
     hwdev.open_tx(tx_key);
-    if (is_alpha_tx)
+
+    // figure out if we need to make additional tx pubkeys
+    size_t num_stdaddresses = 0;
+    size_t num_subaddresses = 0;
+    account_public_address single_dest_subaddress;
+    classify_addresses(destinations, change_addr, num_stdaddresses, num_subaddresses, single_dest_subaddress);
+    bool need_additional_txkeys = num_subaddresses > 0 && (num_stdaddresses > 0 || num_subaddresses > 1);
+    if (need_additional_txkeys)
     {
-      // quietly override the tx key.
-      tx_key = get_deterministic_keypair_from_height(1).sec;
+      additional_tx_keys.clear();
+      for (const auto &d: destinations)
+        additional_tx_keys.push_back(keypair::generate(sender_account_keys.get_device()).sec);
     }
 
-    try {
-      // figure out if we need to make additional tx pubkeys
-      size_t num_stdaddresses = 0;
-      size_t num_subaddresses = 0;
-      account_public_address single_dest_subaddress;
-      classify_addresses(destinations, change_addr, num_stdaddresses, num_subaddresses, single_dest_subaddress);
-      bool need_additional_txkeys = num_subaddresses > 0 && (num_stdaddresses > 0 || num_subaddresses > 1);
-      if (need_additional_txkeys)
-      {
-        additional_tx_keys.clear();
-        for (const auto &d: destinations)
-          additional_tx_keys.push_back(keypair::generate(sender_account_keys.get_device()).sec);
-      }
-
-      bool r = construct_tx_with_tx_key(sender_account_keys, subaddresses, sources, destinations, change_addr, extra, tx, unlock_time, tx_key, additional_tx_keys, rct, rct_config, msout);
-      hwdev.close_tx();
-      return r;
-    } catch(...) {
-      hwdev.close_tx();
-      throw;
-    }
+    bool r = construct_tx_with_tx_key(sender_account_keys, subaddresses, sources, destinations, change_addr, extra, tx, unlock_time, tx_key, additional_tx_keys, rct_config, msout, true /*shuffle_outs*/, tx_params);
+    hwdev.close_tx();
+    return r;
   }
   //---------------------------------------------------------------
-  bool construct_tx(const account_keys& sender_account_keys, std::vector<tx_source_entry>& sources, const std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::account_public_address>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, uint64_t unlock_time)
+  bool construct_tx(const account_keys& sender_account_keys, std::vector<tx_source_entry> &sources, const std::vector<tx_destination_entry>& destinations, const boost::optional<cryptonote::tx_destination_entry>& change_addr, const std::vector<uint8_t> &extra, transaction& tx, uint64_t unlock_time, const coinevo_construct_tx_params &tx_params)
   {
      std::unordered_map<crypto::public_key, cryptonote::subaddress_index> subaddresses;
      subaddresses[sender_account_keys.m_account_address.m_spend_public_key] = {0,0};
      crypto::secret_key tx_key;
      std::vector<crypto::secret_key> additional_tx_keys;
      std::vector<tx_destination_entry> destinations_copy = destinations;
+
+
      return construct_tx_and_get_tx_key(sender_account_keys, subaddresses, sources, destinations_copy, change_addr, extra, tx, unlock_time, tx_key, additional_tx_keys, false, { rct::RangeProofBorromean, 0}, NULL);
   }
   //---------------------------------------------------------------
@@ -663,12 +969,10 @@ namespace cryptonote
     r = parse_and_validate_tx_from_blob(tx_bl, bl.miner_tx);
     CHECK_AND_ASSERT_MES(r, false, "failed to parse coinbase tx from hard coded blob");
     bl.major_version = CURRENT_BLOCK_MAJOR_VERSION;
-    bl.minor_version = CURRENT_BLOCK_MINOR_VERSION;
+	bl.minor_version = CURRENT_BLOCK_MINOR_VERSION;
     bl.timestamp = 0;
     bl.nonce = nonce;
-    miner::find_nonce_for_given_block([](const cryptonote::block &b, uint64_t height, unsigned int threads, crypto::hash &hash){
-      return cryptonote::get_block_longhash(NULL, b, hash, height, threads);
-    }, bl, 1, 0);
+    miner::find_nonce_for_given_block(NULL, bl, 1, 0);
     bl.invalidate_hashes();
     return true;
   }
@@ -681,10 +985,17 @@ namespace cryptonote
 
   bool get_block_longhash(const Blockchain *pbc, const block& b, crypto::hash& res, const uint64_t height, const int miners)
   {
+    const blobdata bd                 = get_block_hashing_blob(b);
+    const uint8_t hf_version          = b.major_version;
+    crypto::cn_slow_hash_type cn_type = cn_slow_hash_type::heavy_v1;
+
+#if defined(COINEVO_ENABLE_INTEGRATION_TEST_HOOKS)
+    const_cast<int &>(miners) = 0;
+#endif
 
     blobdata bd = get_block_hashing_blob(b);
-    if (b.major_version >= RX_BLOCK_VERSION)
-    {
+	    if (b.major_version >= RX_BLOCK_VERSION)
+	    {
       uint64_t seed_height, main_height;
       crypto::hash hash;
       if (pbc != NULL)
@@ -699,9 +1010,9 @@ namespace cryptonote
         main_height = 0;
       }
       rx_slow_hash(main_height, seed_height, hash.data, bd.data(), bd.size(), res.data, miners, 0);
-    } else {
-      const int pow_variant = b.major_version >= 7 ? b.major_version - 6 : 0;
-      crypto::cn_slow_hash(bd.data(), bd.size(), res, pow_variant, height);
+        else {
+	      const int pow_variant = b.major_version >= 7 ? b.major_version - 6 : 0;
+	      crypto::cn_slow_hash(bd.data(), bd.size(), res, pow_variant, height);
     }
     return true;
   }
